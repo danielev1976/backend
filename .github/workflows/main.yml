@@ -1,0 +1,92 @@
+name: Build & Deploy
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'   # triggers on version tags like v1.0.0, v2.3.1
+
+env:
+  JAVA_VERSION: '21'
+  APP_NAME: my-spring-app
+  DEPLOY_DIR: /opt/my-spring-app
+  SERVICE_NAME: my-spring-app
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: maven   # or 'gradle'
+
+      # ── Build ──────────────────────────────────────────────────────────────
+      - name: Build with Maven
+        run: mvn -B clean package -DskipTests
+        # For Gradle: run: ./gradlew clean bootJar
+
+      - name: Rename JAR with version
+        run: |
+          JAR=$(ls target/*.jar | grep -v 'original')
+          cp "$JAR" "target/${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}.jar"
+
+      # ── GitHub Release ──────────────────────────────────────────────────────
+      - name: Create GitHub Release and attach JAR
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: Release ${{ steps.version.outputs.VERSION }}
+          generate_release_notes: true
+          files: target/${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}.jar
+
+      # ── Deploy to EC2 ───────────────────────────────────────────────────────
+      - name: Copy JAR to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "target/${{ env.APP_NAME }}-${{ steps.version.outputs.VERSION }}.jar"
+          target: "${{ env.DEPLOY_DIR }}/releases/"
+          strip_components: 1   # removes the 'target/' prefix
+
+      - name: Update symlink and restart service
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: VERSION
+          script: |
+            set -e
+            JAR="${{ env.DEPLOY_DIR }}/releases/${{ env.APP_NAME }}-${VERSION}.jar"
+
+            # Point symlink to the new version (atomic swap)
+            ln -sfn "$JAR" "${{ env.DEPLOY_DIR }}/current.jar"
+
+            # Restart the service
+            sudo systemctl restart ${{ env.SERVICE_NAME }}
+            sudo systemctl status ${{ env.SERVICE_NAME }} --no-pager
+
+      - name: Health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            sleep 10
+            curl -sf http://localhost:8080/actuator/health \
+              || (echo "Health check failed" && exit 1)
